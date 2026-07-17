@@ -1,13 +1,21 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadGatewayException, Injectable, NotFoundException } from "@nestjs/common";
 import { Message, Session } from "@prisma/client";
 
+import { LlmService } from "../llm/llm.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { CreateMessageDto } from "./dto/create-message.dto";
 import { CreateSessionDto } from "./dto/create-session.dto";
 
+// How many prior turns to send as context, to keep prompts within the
+// model's context window on long-running sessions.
+const HISTORY_LIMIT = 20;
+
 @Injectable()
 export class SessionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly llmService: LlmService,
+  ) {}
 
   createSession(dto: CreateSessionDto): Promise<Session> {
     return this.prisma.session.create({
@@ -41,12 +49,27 @@ export class SessionsService {
   ): Promise<{ userMessage: Message; assistantMessage: Message }> {
     await this.getSession(sessionId);
 
+    const priorMessages = await this.prisma.message.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: "asc" },
+      take: -HISTORY_LIMIT,
+    });
+
     const userMessage = await this.prisma.message.create({
       data: { sessionId, role: "user", content: dto.content },
     });
 
-    // TODO: replace with a real LLM call (see docs/PROJECT_SPEC.md requirement 2).
-    const replyContent = await this.generateReply(sessionId, dto.content);
+    let replyContent: string;
+    try {
+      replyContent = await this.llmService.generateReply([
+        ...priorMessages.map(({ role, content }) => ({ role, content })),
+        { role: "user", content: dto.content },
+      ]);
+    } catch {
+      // The user's message is already persisted, so the conversation history
+      // isn't lost even though we couldn't get a reply this time.
+      throw new BadGatewayException("Failed to generate a reply from the LLM service");
+    }
 
     const assistantMessage = await this.prisma.message.create({
       data: { sessionId, role: "assistant", content: replyContent },
@@ -63,9 +86,5 @@ export class SessionsService {
   async deleteSession(id: string): Promise<void> {
     await this.getSession(id);
     await this.prisma.session.delete({ where: { id } });
-  }
-
-  private generateReply(_sessionId: string, userContent: string): Promise<string> {
-    return Promise.resolve(`Echo: ${userContent}`);
   }
 }

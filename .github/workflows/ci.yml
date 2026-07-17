@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/llm_chat?schema=public"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Start Postgres
+        run: docker compose up -d --wait db
+
+      - name: Apply migrations
+        run: pnpm --filter server prisma:migrate:deploy
+
+      - name: Lint
+        run: pnpm --filter server lint
+
+      - name: Build
+        run: pnpm --filter server build
+
+      - name: Unit tests
+        run: pnpm --filter server test
+
+      - name: E2E tests
+        run: pnpm --filter server test:e2e
+
+      - name: Integration tests
+        run: pnpm --filter server test:integration
