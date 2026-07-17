@@ -40,7 +40,7 @@ describe("SessionsService", () => {
       findMany: jest.Mock;
     };
   };
-  let llm: { generateReply: jest.Mock };
+  let llm: { generateReply: jest.Mock; streamReply: jest.Mock };
 
   beforeEach(async () => {
     prisma = {
@@ -56,7 +56,7 @@ describe("SessionsService", () => {
         findMany: jest.fn(),
       },
     };
-    llm = { generateReply: jest.fn() };
+    llm = { generateReply: jest.fn(), streamReply: jest.fn() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -179,7 +179,9 @@ describe("SessionsService", () => {
         where: { id: SESSION_ID },
         data: { updatedAt: expect.any(Date) },
       });
-      expect(result).toEqual({ userMessage, assistantMessage });
+      // Only the assistant's reply comes back — the caller already knows
+      // what it just sent, so echoing the user message back is redundant.
+      expect(result).toEqual(assistantMessage);
     });
 
     it("sends prior conversation history to the LLM ahead of the new message", async () => {
@@ -213,6 +215,59 @@ describe("SessionsService", () => {
       llm.generateReply.mockRejectedValue(new Error("provider timeout"));
 
       await expect(service.addMessage(SESSION_ID, { content: "hi" })).rejects.toThrow(
+        BadGatewayException,
+      );
+
+      expect(prisma.message.create).toHaveBeenCalledTimes(1);
+      expect(prisma.session.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("streamMessage", () => {
+    it("forwards tokens via the callback and persists the full reply", async () => {
+      prisma.session.findUnique.mockResolvedValue(makeSession());
+      prisma.message.findMany.mockResolvedValue([]);
+      const userMessage = makeMessage({ id: "user-msg", role: "user", content: "hi" });
+      const assistantMessage = makeMessage({
+        id: "assistant-msg",
+        role: "assistant",
+        content: "Echo: hi",
+      });
+      prisma.message.create
+        .mockResolvedValueOnce(userMessage)
+        .mockResolvedValueOnce(assistantMessage);
+      llm.streamReply.mockImplementation(
+        async (_messages: unknown, onToken: (token: string) => void) => {
+          onToken("Echo: ");
+          onToken("hi");
+          return "Echo: hi";
+        },
+      );
+
+      const onToken = jest.fn();
+      const result = await service.streamMessage(SESSION_ID, { content: "hi" }, onToken);
+
+      expect(onToken.mock.calls).toEqual([["Echo: "], ["hi"]]);
+      expect(prisma.message.create).toHaveBeenNthCalledWith(2, {
+        data: { sessionId: SESSION_ID, role: "assistant", content: "Echo: hi" },
+      });
+      expect(prisma.session.update).toHaveBeenCalledWith({
+        where: { id: SESSION_ID },
+        data: { updatedAt: expect.any(Date) },
+      });
+      expect(result).toEqual(assistantMessage);
+    });
+
+    // Boundary case for LLM integration: same failure contract as addMessage.
+    it("keeps the user message but surfaces a 502 when the stream fails", async () => {
+      prisma.session.findUnique.mockResolvedValue(makeSession());
+      prisma.message.findMany.mockResolvedValue([]);
+      prisma.message.create.mockResolvedValueOnce(
+        makeMessage({ id: "user-msg", role: "user", content: "hi" }),
+      );
+      llm.streamReply.mockRejectedValue(new Error("provider timeout"));
+
+      await expect(service.streamMessage(SESSION_ID, { content: "hi" }, jest.fn())).rejects.toThrow(
         BadGatewayException,
       );
 

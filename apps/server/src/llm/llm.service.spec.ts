@@ -6,6 +6,17 @@ const makeConfig = (values: Record<string, string>): ConfigService => {
   return { get: (key: string) => values[key] } as unknown as ConfigService;
 };
 
+const sseStream = (lines: string[]): ReadableStream<Uint8Array> => {
+  const body = lines.map((line) => `data: ${line}\n\n`).join("");
+  const bytes = new TextEncoder().encode(body);
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+};
+
 describe("LlmService", () => {
   const originalFetch = global.fetch;
 
@@ -76,5 +87,40 @@ describe("LlmService", () => {
     await expect(service.generateReply([{ role: "user", content: "hello" }])).rejects.toThrow(
       "did not include a message",
     );
+  });
+
+  describe("streamReply", () => {
+    it("calls onToken for each chunk and returns the full accumulated text", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        body: sseStream([
+          JSON.stringify({ choices: [{ delta: { content: "Hel" } }] }),
+          JSON.stringify({ choices: [{ delta: { content: "lo" } }] }),
+          "[DONE]",
+        ]),
+      }) as unknown as typeof fetch;
+
+      const service = new LlmService(makeConfig({ LLM_API_KEY: "test-key" }));
+      const onToken = jest.fn();
+      const result = await service.streamReply([{ role: "user", content: "hi" }], onToken);
+
+      expect(onToken.mock.calls).toEqual([["Hel"], ["lo"]]);
+      expect(result).toBe("Hello");
+    });
+
+    it("throws when the API responds with a non-2xx status", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        body: null,
+        text: () => Promise.resolve("boom"),
+      }) as unknown as typeof fetch;
+
+      const service = new LlmService(makeConfig({ LLM_API_KEY: "test-key" }));
+
+      await expect(
+        service.streamReply([{ role: "user", content: "hi" }], jest.fn()),
+      ).rejects.toThrow("LLM API responded with 500");
+    });
   });
 });

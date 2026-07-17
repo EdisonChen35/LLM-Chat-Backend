@@ -1,7 +1,7 @@
 import { BadGatewayException, Injectable, NotFoundException } from "@nestjs/common";
 import { Message, Session } from "@prisma/client";
 
-import { LlmService } from "../llm/llm.service";
+import { LlmMessage, LlmService } from "../llm/llm.service";
 import { PrismaService } from "../prisma/prisma.service";
 import { CreateMessageDto } from "./dto/create-message.dto";
 import { CreateSessionDto } from "./dto/create-session.dto";
@@ -43,26 +43,18 @@ export class SessionsService {
     });
   }
 
-  async addMessage(
-    sessionId: string,
-    dto: CreateMessageDto,
-  ): Promise<{ userMessage: Message; assistantMessage: Message }> {
+  async addMessage(sessionId: string, dto: CreateMessageDto): Promise<Message> {
     await this.getSession(sessionId);
+    const history = await this.buildHistory(sessionId);
 
-    const priorMessages = await this.prisma.message.findMany({
-      where: { sessionId },
-      orderBy: { createdAt: "asc" },
-      take: -HISTORY_LIMIT,
-    });
-
-    const userMessage = await this.prisma.message.create({
+    await this.prisma.message.create({
       data: { sessionId, role: "user", content: dto.content },
     });
 
     let replyContent: string;
     try {
       replyContent = await this.llmService.generateReply([
-        ...priorMessages.map(({ role, content }) => ({ role, content })),
+        ...history,
         { role: "user", content: dto.content },
       ]);
     } catch {
@@ -71,20 +63,62 @@ export class SessionsService {
       throw new BadGatewayException("Failed to generate a reply from the LLM service");
     }
 
-    const assistantMessage = await this.prisma.message.create({
-      data: { sessionId, role: "assistant", content: replyContent },
+    return this.touchAndSaveReply(sessionId, replyContent);
+  }
+
+  /**
+   * Streaming counterpart to addMessage: calls onToken as each chunk of the
+   * reply arrives instead of resolving once with the full text. Persistence
+   * semantics match addMessage — the user message is always saved, and the
+   * assistant message is only saved if the LLM call succeeds end to end.
+   */
+  async streamMessage(
+    sessionId: string,
+    dto: CreateMessageDto,
+    onToken: (token: string) => void,
+  ): Promise<Message> {
+    await this.getSession(sessionId);
+    const history = await this.buildHistory(sessionId);
+
+    await this.prisma.message.create({
+      data: { sessionId, role: "user", content: dto.content },
     });
 
-    await this.prisma.session.update({
-      where: { id: sessionId },
-      data: { updatedAt: new Date() },
-    });
+    let replyContent: string;
+    try {
+      replyContent = await this.llmService.streamReply(
+        [...history, { role: "user", content: dto.content }],
+        onToken,
+      );
+    } catch {
+      throw new BadGatewayException("Failed to generate a reply from the LLM service");
+    }
 
-    return { userMessage, assistantMessage };
+    return this.touchAndSaveReply(sessionId, replyContent);
   }
 
   async deleteSession(id: string): Promise<void> {
     await this.getSession(id);
     await this.prisma.session.delete({ where: { id } });
+  }
+
+  private async buildHistory(sessionId: string): Promise<LlmMessage[]> {
+    const priorMessages = await this.prisma.message.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: "asc" },
+      take: -HISTORY_LIMIT,
+    });
+    return priorMessages.map(({ role, content }) => ({ role, content }));
+  }
+
+  private async touchAndSaveReply(sessionId: string, content: string): Promise<Message> {
+    const assistantMessage = await this.prisma.message.create({
+      data: { sessionId, role: "assistant", content },
+    });
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: { updatedAt: new Date() },
+    });
+    return assistantMessage;
   }
 }

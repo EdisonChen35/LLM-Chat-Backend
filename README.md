@@ -14,6 +14,10 @@ pnpm dev
 
 - Feel free to install other dependencies you need.
 
+## API Documentation
+
+Interactive OpenAPI docs (Swagger UI) are served at **http://localhost:3000/docs** once the server is running — covers every endpoint, request/response schemas, and status codes.
+
 ## LLM Provider
 
 `LlmService` ([`llm.service.ts`](apps/server/src/llm/llm.service.ts)) talks to any OpenAI-compatible `/v1/chat/completions` endpoint, configured via three env vars (see [`.env.example`](apps/server/.env.example)):
@@ -28,7 +32,7 @@ pnpm dev
 
 Free, OpenAI-compatible: https://build.nvidia.com/models. Set `LLM_API_KEY` to a key from there — `LLM_API_URL`/`LLM_MODEL` already default to NVIDIA.
 
-### Local LLM via Ollama (bonus)
+### Local LLM via Ollama
 
 1. Install [Ollama](https://ollama.com) and pull a small model: `ollama pull llama3.2:1b`
 2. In `apps/server/.env`:
@@ -39,6 +43,22 @@ Free, OpenAI-compatible: https://build.nvidia.com/models. Set `LLM_API_KEY` to a
    (leave `LLM_API_KEY` unset — Ollama doesn't need one)
 
 No code changes needed to switch between the two — both speak the same request/response shape.
+
+### Streaming
+
+`POST /sessions/:id/messages/stream` is the streaming counterpart to `POST /sessions/:id/messages` — same request body, but the reply arrives as Server-Sent Events instead of one JSON blob:
+
+```
+curl -N -X POST http://localhost:3000/sessions/<id>/messages/stream \
+  -H "Content-Type: application/json" \
+  -d '{"content":"hi"}'
+```
+
+- `event: token` — one per chunk, `data: {"content": "..."}`
+- `event: done` — once the reply is fully generated and persisted, `data` has the final `userMessage`/`assistantMessage` (same shape as the non-streaming endpoint)
+- `event: error` — if the LLM call fails mid-stream
+
+Chosen over WebSocket because the data only flows one way (server → client) and this fits directly into the existing REST resource model instead of needing a separate gateway/connection-management layer — see [`sessions.controller.ts`](apps/server/src/sessions/sessions.controller.ts).
 
 ## Testing
 
