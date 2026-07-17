@@ -16,5 +16,75 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    # Calls the prisma binary directly rather than "pnpm run" — the deployed
+    # package.json has no packageManager pin, so corepack would fetch a
+    # newer pnpm at container runtime, whose stricter dependency checks
+    # abort without a TTY.
+    command: ["node_modules/.bin/prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/llm_chat?schema=public"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - apps/server/.env
+    environment:
+      # Overrides the host-oriented value from apps/server/.env: inside the
+      # compose network the DB is reachable at the service name, not localhost.
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/llm_chat?schema=public"
+      # apps/server/.env's LLM_API_URL points at a local Ollama on localhost,
+      # which from inside the container isn't your host machine — override to
+      # the natively-installed Ollama via host.docker.internal. Swap this for
+      # "http://ollama:11434/v1/chat/completions" if using the local-llm
+      # profile's containerized Ollama instead, or delete it for NVIDIA.
+      LLM_API_URL: "http://host.docker.internal:11434/v1/chat/completions"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Optional, containerized local LLM for the bonus requirement — doesn't
+  # start with a plain `docker compose up`. Run with:
+  #   docker compose --profile local-llm up -d
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Pulls a small model into the ollama service above, then exits. Re-running
+  # is cheap — already-pulled models are a no-op.
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    entrypoint: ["ollama", "pull", "llama3.2:1b"]
+    environment:
+      OLLAMA_HOST: "ollama:11434"
+    depends_on:
+      ollama:
+        condition: service_healthy
+
 volumes:
   db-data:
+  ollama-data:
